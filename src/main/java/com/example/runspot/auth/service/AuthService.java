@@ -3,35 +3,37 @@ package com.example.runspot.auth.service;
 import com.example.runspot.auth.api.dto.request.LoginRequest;
 import com.example.runspot.auth.api.dto.request.SignupRequest;
 import com.example.runspot.auth.api.dto.response.TokenResponse;
-import com.example.runspot.global.jwt.JwtTokenProvider;
+import com.example.runspot.auth.domain.entity.RefreshToken;
+import com.example.runspot.auth.domain.repository.RefreshTokenRepository;
+import com.example.runspot.global.jwt.TokenProvider;
 import com.example.runspot.user.domain.entity.User;
 import com.example.runspot.user.domain.repository.UserRepository;
-import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
-import org.springframework.security.config.annotation.authentication.builders.AuthenticationManagerBuilder;
-import org.springframework.security.core.Authentication;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDateTime;
 
 @Service
 @RequiredArgsConstructor
-@Transactional
+@Transactional(readOnly = true)
 public class AuthService {
 
     private final UserRepository userRepository;
+    private final RefreshTokenRepository refreshTokenRepository;
     private final PasswordEncoder passwordEncoder;
-    private final AuthenticationManagerBuilder authenticationManagerBuilder;
-    private final JwtTokenProvider jwtTokenProvider;
+    private final TokenProvider tokenProvider;
 
+    @Transactional
     public void signup(SignupRequest request) {
-        validateDuplicateLoginId(request.getLoginId());
-
-        String encodedPassword = passwordEncoder.encode(request.getPassword());
+        if (userRepository.existsByLoginId(request.getLoginId())) {
+            throw new IllegalArgumentException("이미 사용 중인 아이디입니다.");
+        }
 
         User user = User.create(
                 request.getLoginId(),
-                encodedPassword,
+                passwordEncoder.encode(request.getPassword()),
                 request.getName(),
                 request.getAgeGroup(),
                 request.getWeeklyRunningCount(),
@@ -41,22 +43,58 @@ public class AuthService {
         userRepository.save(user);
     }
 
+    @Transactional
     public TokenResponse login(LoginRequest request) {
-        // 1. Login ID/PW 를 기반으로 Authentication 객체 생성
-        // 이때 authentication 는 인증 여부를 확인하는 authenticated 값이 false
-        UsernamePasswordAuthenticationToken authenticationToken = new UsernamePasswordAuthenticationToken(request.getLoginId(), request.getPassword());
+        User user = userRepository.findByLoginId(request.getLoginId())
+                .orElseThrow(() -> new IllegalArgumentException("아이디 또는 비밀번호가 잘못되었습니다."));
 
-        // 2. 실제 검증 (사용자 비밀번호 체크)이 이루어지는 부분
-        // authenticate 매서드가 실행될 때 CustomUserDetailsService 에서 만든 loadUserByUsername 메서드가 실행
-        Authentication authentication = authenticationManagerBuilder.getObject().authenticate(authenticationToken);
+        if (!passwordEncoder.matches(request.getPassword(), user.getPassword())) {
+            throw new IllegalArgumentException("아이디 또는 비밀번호가 잘못되었습니다.");
+        }
 
-        // 3. 인증 정보를 기반으로 JWT 토큰 생성
-        return jwtTokenProvider.generateToken(authentication);
+        String accessToken = tokenProvider.createAccessToken(user.getId(), user.getRole().name());
+        String refreshTokenString = tokenProvider.createRefreshToken();
+        long refreshTokenValidityInSeconds = tokenProvider.getRefreshTokenValidityInSeconds();
+
+        // 기존 리프레시 토큰이 있으면 업데이트, 없으면 새로 생성
+        RefreshToken refreshToken = refreshTokenRepository.findByUserId(user.getId())
+                .orElse(RefreshToken.builder()
+                        .user(user)
+                        .refreshToken(refreshTokenString)
+                        .expiresAt(LocalDateTime.now().plusSeconds(refreshTokenValidityInSeconds))
+                        .build());
+
+        refreshToken.updateToken(refreshTokenString, LocalDateTime.now().plusSeconds(refreshTokenValidityInSeconds));
+        refreshTokenRepository.save(refreshToken);
+
+        return new TokenResponse(accessToken, refreshTokenString);
     }
 
-    private void validateDuplicateLoginId(String loginId) {
-        if (userRepository.existsByLoginId(loginId)) {
-            throw new IllegalArgumentException("이미 사용 중인 로그인 아이디입니다.");
+    @Transactional
+    public void logout(Long userId) {
+        refreshTokenRepository.deleteByUserId(userId);
+    }
+
+    @Transactional
+    public TokenResponse refresh(String refreshTokenString) {
+        if (!tokenProvider.validateToken(refreshTokenString)) {
+            throw new IllegalArgumentException("유효하지 않은 리프레시 토큰입니다.");
         }
+
+        RefreshToken refreshToken = refreshTokenRepository.findByRefreshToken(refreshTokenString)
+                .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 리프레시 토큰입니다."));
+
+        if (refreshToken.getExpiresAt().isBefore(LocalDateTime.now())) {
+            throw new IllegalArgumentException("만료된 리프레시 토큰입니다.");
+        }
+
+        User user = refreshToken.getUser();
+        String newAccessToken = tokenProvider.createAccessToken(user.getId(), user.getRole().name());
+        String newRefreshTokenString = tokenProvider.createRefreshToken();
+        long refreshTokenValidityInSeconds = tokenProvider.getRefreshTokenValidityInSeconds();
+
+        refreshToken.updateToken(newRefreshTokenString, LocalDateTime.now().plusSeconds(refreshTokenValidityInSeconds));
+
+        return new TokenResponse(newAccessToken, newRefreshTokenString);
     }
 }
